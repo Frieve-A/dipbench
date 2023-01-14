@@ -14,7 +14,7 @@ app_title = 'DiP-Bench : Digital Piano Benchmark'
 
 # settings
 pitch_direction_threshohld = 0.9
-velocity_direction_threshohld = 0.995
+velocity_direction_threshohld = 0.99
 
 # size
 screen_size = (1920, 1080)
@@ -133,7 +133,9 @@ class DipBench:
         info = self.audio.get_host_api_info_by_index(0)
         device_count = info.get('deviceCount')
         for i in range(device_count):
-            self.audio_inputs.append(self.audio.get_device_info_by_host_api_device_index(0, i).get('name'))
+            device = self.audio.get_device_info_by_host_api_device_index(0, i)
+            if device.get('maxInputChannels') >= 2:
+                self.audio_inputs.append(device.get('name'))
         
     def __del__(self):
         self.terminate()
@@ -158,7 +160,8 @@ class DipBench:
         device_count = info.get('deviceCount')
         index = -1
         for i in range(device_count):
-            if self.audio_inputs[0] == self.audio.get_device_info_by_host_api_device_index(0, i).get('name'):
+            device = self.audio.get_device_info_by_host_api_device_index(0, i)
+            if self.audio_inputs[0] == device.get('name') and device.get('maxInputChannels') >= 2:
                 index = i
         if index >= 0:
             self.stream = self.audio.open(input=True, input_device_index = index, format=pyaudio.paInt16, channels=2, rate=sampling_freq, frames_per_buffer=sample_length)        
@@ -437,10 +440,10 @@ class DipBench:
             for midi_event in midi_events:
                 key = midi_event[0][1] - 21
                 if key >=0 and key < 88:
-                    if midi_event[0][0] & 0xf0 == 0x90: # note on
+                    if midi_event[0][0] & 0xf0 == 0x90 and midi_event[0][2] > 0: # note on
                         self.realtime_note_on[key] = self.realtime_key_on[key] = True
                         self.realtime_velocity[key] = midi_event[0][2]
-                    if midi_event[0][0] & 0xf0 == 0x80: # note off
+                    if midi_event[0][0] & 0xf0 == 0x80 or (midi_event[0][0] & 0xf0 == 0x90 and midi_event[0][2] == 0): # note off
                         self.realtime_key_on[key] = False
                         self.realtime_note_on[key] = self.realtime_note_on[key] and self.realtime_damper_on
                 if midi_event[0][0] & 0xf0 == 0xb0: # control
