@@ -10,38 +10,13 @@ from pygame.locals import *
 import pyaudio
 import numpy as np
 
-app_title = 'DiP-Bench : Digital Piano Benchmark'
 
 # settings
-pitch_direction_threshohld = 0.9
-velocity_direction_threshohld = 0.99
-
-# size
-screen_size = (1920, 1080)
-# screen_size = (2560, 1440)
-# screen_size = (3840, 2160)
-line_width = screen_size[1] // 1081 + 1
-base_size = screen_size[0] // 240 # 8 pixel in 1920 x 1080
-base_margin = base_size * 3
-vector_scope_size = screen_size[1] / 16 # sd = height/32
-
-# keyboard size
-keyboard_margin_x = base_size * 3
-key_width = (screen_size[0] - keyboard_margin_x * 2) / 52
-keyboard_top = base_size * 100
-energy_bottom = keyboard_top - keyboard_margin_x
-white_key_width = round(key_width * 33 / 36) #22.5 / 23.5
-white_key_height = round(key_width * 150 / 23.5)
-black_key_width = round(key_width * 23 / 36) #15 / 23.5
-black_key_height = round(key_width * 100 / 23.5)
-
-# velocity size
-velocity_width = base_size * 16
-velocity_size = base_size // 2
-velocity_bottom = keyboard_top - base_size * 14 
-
-
 sampling_freq = 48000
+pitch_direction_threshohld = 0.95
+velocity_direction_threshohld = 0.9987
+latency_thresould = 0.15 # ratio from std (0.01 means 1% of std)
+
 sample_length = 2048
 
 correl_size = 2048
@@ -51,12 +26,40 @@ realtime_analysis_length = 8192
 spectrum_size = 8192
 
 
+# size
+screen_size = None
+floating_window_size = (1280, 720)
+window_size = None
+full_screen = False
+line_width = None
+base_size = None
+base_margin = None
+vector_scope_size = None
+
+# keyboard size
+keyboard_margin_x = None
+key_width = None
+keyboard_top = None
+energy_bottom = None
+white_key_width = None
+white_key_height = None
+black_key_width = None
+black_key_height = None
+
+# UI velocity size
+velocity_width = None
+velocity_size = None
+velocity_bottom = None
+
+
 class Keyboard:
-    keys = []
+    keys = None
 
     def __init__(self):
+        global keyboard_margin_x, key_width
         class Key:
             pass
+        self.keys = []
         for i in range(128):
             oct = i // 12 - 1
             note = i % 12
@@ -68,6 +71,41 @@ class Keyboard:
             key.x = x
             key.normalized_x = round(keyboard_margin_x + 0.5 * key_width + (key_width * 7) / 12 * (i - 21))
             self.keys.append(key)
+
+
+def SetUI():
+    global screen_size, floating_window_size, window_size, full_screen, line_width, base_size, base_margin, vector_scope_size
+    global keyboard_margin_x, key_width, keyboard_top, energy_bottom, white_key_width, white_key_height, black_key_width, black_key_height
+    global velocity_width, velocity_size, velocity_bottom
+
+    if full_screen:
+        window_size = screen_size
+    else:
+        window_size = floating_window_size
+    line_width = window_size[1] // 1081 + 1
+    base_size = window_size[0] // 240 # 8 pixel in 1920 x 1080
+    base_margin = base_size * 3
+    vector_scope_size = window_size[1] / 16 # sd = height/32
+
+    # keyboard size
+    keyboard_margin_x = base_size * 3
+    key_width = (window_size[0] - keyboard_margin_x * 2) / 52
+    keyboard_top = base_size * 100
+    energy_bottom = keyboard_top - keyboard_margin_x
+    white_key_width = round(key_width * 33 / 36) #22.5 / 23.5
+    white_key_height = round(key_width * 150 / 23.5)
+    black_key_width = round(key_width * 23 / 36) #15 / 23.5
+    black_key_height = round(key_width * 100 / 23.5)
+
+    # velocity size
+    velocity_width = base_size * 16
+    velocity_size = base_size // 2
+    velocity_bottom = keyboard_top - base_size * 14 
+
+    pygame.display.set_mode(window_size, pygame.FULLSCREEN if full_screen else pygame.RESIZABLE) # workaround
+    return pygame.display.set_mode(window_size, pygame.FULLSCREEN if full_screen else pygame.RESIZABLE), Keyboard()
+
+
 
 class DipBench:
     audio_inputs = []
@@ -94,6 +132,9 @@ class DipBench:
     pitch_color = [(255,255,255)] * 88
     pitch_variation = None
     pitch_checked = None
+    pitch_latency = None
+    pitch_latency_average = None
+    pitch_latency_std = None
 
     # measurement results in velocity direction
     velocity = -1
@@ -269,6 +310,9 @@ class DipBench:
         self.tone = 0
         self.pitch_variation = 0
         self.pitch_checked = 0
+        self.pitch_latency = [None] * 88
+        self.pitch_latency_average = None
+        self.pitch_latency_std = None
 
     def __get_spectrum(self, waveform):
         waveform = np.sum(waveform,axis=1)
@@ -281,7 +325,7 @@ class DipBench:
         spectrum = np.log(np.abs(np.fft.fft(waveform))) / np.log(2) * 6.0 # in dB
         return np.clip(spectrum - spectrum.max() + 96, 0, 96)
 
-    def __check_duplication(self, waveform1, waveform2, nextnote=False):
+    def __check_duplication(self, pos, waveform1, waveform2, nextnote=False):
         if nextnote:
             ratio = np.exp(np.log(2.0) / 12.0)
             original_pos = np.linspace(0, len(waveform1) , len(waveform1))
@@ -301,9 +345,19 @@ class DipBench:
             if correl > max_correl:
                 max_correl = correl
                 shift_pos = shift
-        print(shift_pos - shift_range, max_correl)
+        print(pos, shift_pos - shift_range, max_correl)
 
         return max_correl
+
+    def __check_latency(self, waveform):
+        left_attack = waveform[sample_length:sample_length * 2,0]
+        std = np.std(left_attack)
+        indices = np.where(np.abs(left_attack) > std * latency_thresould)
+        if indices[0].size > 0:
+            return indices[0][0] / sampling_freq
+        else:
+            return None
+
 
     def __pitch_variation_measurement(self):
         if self.stream is not None:
@@ -323,7 +377,7 @@ class DipBench:
 
                     duplication = False
                     if self.tone > 0:
-                        max_correl = self.__check_duplication(self.pitch_waveforms[self.tone - 1], self.pitch_waveforms[self.tone], True)
+                        max_correl = self.__check_duplication(self.tone + 21, self.pitch_waveforms[self.tone - 1], self.pitch_waveforms[self.tone], True)
                         self.pitch_correl[self.tone - 1] = max_correl
                         duplication = max_correl > pitch_direction_threshohld
                     self.duplication_in_pitch[self.tone] = duplication
@@ -332,6 +386,11 @@ class DipBench:
                         self.pitch_variation = self.pitch_variation + 1
                     self.pitch_color[self.tone] = colorsys.hsv_to_rgb(self.last_hue, 0.8, 255.0)
                     self.pitch_checked = self.pitch_checked + 1
+                    self.pitch_latency[self.tone] = self.__check_latency(self.pitch_waveforms[self.tone])
+                    self.pitch_latency_average = np.nanmean(np.array(self.pitch_latency, dtype=float))
+                    if len([latency for latency in self.pitch_latency if latency is not None]) >= 1:
+                        self.pitch_latency_std = np.nanstd(np.array(self.pitch_latency, dtype=float))
+
 
                 elif len(self.pitch_waveforms[self.tone]) >= sampling_freq:
                     self.__close_audio()
@@ -382,7 +441,7 @@ class DipBench:
 
                     duplication = False
                     if self.velocity > 0:
-                        max_correl = self.__check_duplication(self.velocity_waveforms[self.velocity - 1], self.velocity_waveforms[self.velocity])
+                        max_correl = self.__check_duplication(self.velocity, self.velocity_waveforms[self.velocity - 1], self.velocity_waveforms[self.velocity])
                         # max_correl = np.dot(self.velocity_spectrums[self.velocity - 1], self.velocity_spectrums[self.velocity]) / ((np.linalg.norm(self.velocity_spectrums[self.velocity - 1]) * np.linalg.norm(self.velocity_spectrums[self.velocity])))
                         self.velocity_correl[self.velocity - 1] = max_correl
                         duplication = max_correl > velocity_direction_threshohld
@@ -493,27 +552,36 @@ def resource_path(relative_path):
     return os.path.join(os.path.abspath("."), relative_path)
 
 def main():
+    global screen_size, floating_window_size, window_size, full_screen, line_width, base_size, base_margin, vector_scope_size
+    global keyboard_margin_x, key_width, keyboard_top, energy_bottom, white_key_width, white_key_height, black_key_width, black_key_height
+    global velocity_width, velocity_size, velocity_bottom
+    app_title = 'DiP-Bench : Digital Piano Benchmark'
+
     # initialization
     pygame.mixer.pre_init(frequency=sampling_freq, size=-16, channels=2)
     pygame.init()
     pygame.display.set_icon(pygame.image.load(resource_path('icon_128x128.png')))
-    screen = pygame.display.set_mode(screen_size)
-    full_screen = False
-
     pygame.display.set_caption(app_title)
+    display_info = pygame.display.Info()
+    screen_size = (display_info.current_w, display_info.current_h)
+
+    screen, keyboard = SetUI()
+    refresh_font = True
 
     dipbench = DipBench()
-    keyboard = Keyboard()
 
     # main_loop
     terminated = False
 
-    font = pygame.font.Font(None, base_size * 4)
-    app_title_text = font.render(app_title + '  /  Frieve 2022', True, (255,255,255))
-    help_text = font.render('[A] Chalge Audio Input, [I] Change MIDI Input, [O] Change MIDI Output, [P] Measure pitch variation, [V] Measure velocity layer, [R] Real-time mode, [Q] Quit', True, (128,192,255))
-    help_text2 = font.render('[ESC] Abort', True, (128,192,255))
     while (not terminated):
         screen.fill((0,0,0))
+
+        if refresh_font:
+            font = pygame.font.Font(None, base_size * 4)
+            app_title_text = font.render(app_title + '  /  Frieve 2022-2024', True, (255,255,255))
+            help_text = font.render('[A] Chalge Audio Input, [I] Change MIDI Input, [O] Change MIDI Output, [P] Measure pitch variation, [V] Measure velocity layer, [R] Real-time mode, [F11] Full screen, [Q] Quit', True, (128,192,255))
+            help_text2 = font.render('[ESC] Abort', True, (128,192,255))
+            refresh_font = False
 
         # handle events
         for event in pygame.event.get():
@@ -526,10 +594,8 @@ def main():
                     dipbench.terminate()
                 elif event.key == K_F11:
                     full_screen = not full_screen
-                    if full_screen:
-                        screen = pygame.display.set_mode(screen_size, FULLSCREEN)
-                    else:
-                        screen = pygame.display.set_mode(screen_size)
+                    screen, keyboard = SetUI()
+                    refresh_font = True
                 elif dipbench.mode == 0:
                     # mode change
                     if event.key == K_p:
@@ -560,6 +626,11 @@ def main():
                     # i/o
                     elif event.key == K_s:
                         dipbench.save_waveforms()
+            elif event.type == pygame.VIDEORESIZE and not full_screen:
+                floating_window_size = (event.w, event.h)
+                screen, keyboard = SetUI()
+                refresh_font = True
+
             elif event.type == MOUSEBUTTONDOWN and event.button == 1:
                 if dipbench.mode == 0:
                     mouse_click_tone = -1    
@@ -573,7 +644,7 @@ def main():
                             if event.pos[0] >= key.x - white_key_width / 2 and event.pos[0] < key.x + white_key_width / 2 and event.pos[1] >= keyboard_top and event.pos[1] < keyboard_top + white_key_height:
                                 if key.note_no >= 21 and key.note_no < 109:
                                     mouse_click_tone = key.note_no - 21
-                    if event.pos[0] >= screen_size[0] - base_margin - velocity_width and event.pos[0] < screen_size[0] - base_margin and event.pos[1] >= velocity_bottom - 127 * velocity_size and event.pos[1] < velocity_bottom:
+                    if event.pos[0] >= window_size[0] - base_margin - velocity_width and event.pos[0] < window_size[0] - base_margin and event.pos[1] >= velocity_bottom - 127 * velocity_size and event.pos[1] < velocity_bottom:
                         mouse_click_velocity = (velocity_bottom - event.pos[1]) // velocity_size
                     dipbench.set_tone(mouse_click_tone)
                     dipbench.set_velocity(mouse_click_velocity)
@@ -603,7 +674,11 @@ def main():
 
         # draw pitch variation
         if dipbench.pitch_variation is not None and dipbench.pitch_checked > 0:
-            pitch_info_text = font.render(f'{dipbench.pitch_variation} / {dipbench.pitch_checked} waveform are recorded ({dipbench.pitch_variation * 100 / dipbench.pitch_checked:.2f}%). One waveform for {dipbench.pitch_checked / dipbench.pitch_variation:.2f} keys on average.', True, (255,192,128))
+            latency_text = ''
+            if dipbench.pitch_latency_std is not None:
+                latency_text = f' Average latency : {dipbench.pitch_latency_average * 1000:.1f}ms, Standard deviation : {dipbench.pitch_latency_std * 1000:.1f}ms.'
+            
+            pitch_info_text = font.render(f'{dipbench.pitch_variation} / {dipbench.pitch_checked} waveform are recorded ({dipbench.pitch_variation * 100 / dipbench.pitch_checked:.2f}%). One waveform for {dipbench.pitch_checked / dipbench.pitch_variation:.2f} keys on average.' + latency_text, True, (255,192,128))
             screen.blit(pitch_info_text, [base_margin, energy_bottom - base_size * 7])
         if dipbench.pitch_correl is not None:
             for key in keyboard.keys[21:108]:
@@ -615,6 +690,15 @@ def main():
                 for i in range(resolution + 1):
                     point.append((x1 + (x2 - x1) * i / resolution, energy_bottom - math.sqrt(math.sin(i / resolution * 3.1415926)) * height))
                 pygame.draw.lines(screen, np.array([255.0,255.0,255.0]) * dipbench.pitch_correl[key.note_no - 21]**2, False, point, line_width)
+        # draw individual latency
+        pygame.draw.line(screen, (128,128,128), (base_margin, window_size[1] - base_margin), (window_size[0] - base_margin, window_size[1] - base_margin))
+        pygame.draw.line(screen, (96,96,96), (base_margin, window_size[1] - base_margin - 0.01 * base_size * 500), (window_size[0] - base_margin, window_size[1] - base_margin - 0.01 * base_size * 500))
+        for key in keyboard.keys[21:109]:
+            if dipbench.pitch_latency is not None and len(dipbench.pitch_latency) > key.note_no - 21 and dipbench.pitch_latency[key.note_no - 21] is not None:
+                display_latency = dipbench.pitch_latency[key.note_no - 21]
+                y = window_size[1] - base_margin - display_latency * base_size * 500
+                pygame.draw.line(screen, (255,192,128), (key.normalized_x - base_size, y), (key.normalized_x + base_size, y), line_width)
+
         # draw key center dot
         for key in keyboard.keys[21:109]:
             pygame.draw.circle(screen, dipbench.pitch_color[key.note_no - 21], (key.normalized_x + 1, energy_bottom + 1), (base_size * 2) // 3, 0)
@@ -625,7 +709,7 @@ def main():
             screen.blit(velocity_info_text, [base_margin, energy_bottom - base_size * 12])
         # draw velocity variation
         for i in range(len(dipbench.velocity_color)):
-            rect = Rect(screen_size[0] - base_margin - velocity_width, velocity_bottom - (i + 1) * velocity_size, velocity_width, velocity_size)
+            rect = Rect(window_size[0] - base_margin - velocity_width, velocity_bottom - (i + 1) * velocity_size, velocity_width, velocity_size)
             pygame.draw.rect(screen, dipbench.velocity_color[i], rect)
         # draw velocity cursor
         velocity = []
@@ -634,24 +718,27 @@ def main():
         if dipbench.realtime_velocity is not None:
             velocity.extend([v - 1 for i, v in enumerate(dipbench.realtime_velocity) if v > 0 and dipbench.realtime_note_on[i]])
         velocity.sort()
-        last_velocity_y = screen_size[1]
+        last_velocity_y = window_size[1]
         for v in velocity:
             velocity_y = velocity_bottom - v * velocity_size - velocity_size // 2
-            pointlist = [[screen_size[0] - base_margin - velocity_width - base_size * 3, velocity_y - base_size],
-                            [screen_size[0] - base_margin - velocity_width - base_size * 3, velocity_y + base_size], 
-                            [screen_size[0] - base_margin - velocity_width - base_size * 1, velocity_y]]
+            pointlist = [[window_size[0] - base_margin - velocity_width - base_size * 3, velocity_y - base_size],
+                            [window_size[0] - base_margin - velocity_width - base_size * 3, velocity_y + base_size], 
+                            [window_size[0] - base_margin - velocity_width - base_size * 1, velocity_y]]
             pygame.draw.polygon(screen, (255,255,255), pointlist)
             if velocity_y < last_velocity_y:
                 velocity_text = font.render(f'{v + 1}', True, (255,255,255))
-                screen.blit(velocity_text, [screen_size[0] - base_margin - velocity_width - base_size * 4 - velocity_text.get_width(), velocity_y - velocity_text.get_height() // 2])
+                screen.blit(velocity_text, [window_size[0] - base_margin - velocity_width - base_size * 4 - velocity_text.get_width(), velocity_y - velocity_text.get_height() // 2])
                 last_velocity_y = velocity_y - base_margin
 
         # prepare waveform
         monitor_wave = None
+        display_latency = None
         if dipbench.monitor_mode == 1 and dipbench.pitch_waveforms is not None and dipbench.tone >= 0 and dipbench.pitch_waveforms[dipbench.tone] is not None:
             if len(dipbench.pitch_waveforms[dipbench.tone]) >= sample_length * 2:
                 monitor_wave = dipbench.pitch_waveforms[dipbench.tone]
                 std = np.std(monitor_wave[sample_length:sample_length * 2])
+                if dipbench.pitch_latency is not None and len(dipbench.pitch_latency) > dipbench.tone:
+                    display_latency = dipbench.pitch_latency[dipbench.tone]
         elif dipbench.monitor_mode == 2 and dipbench.velocity_waveforms is not None and dipbench.velocity >= 0 and dipbench.velocity_waveforms[dipbench.velocity] is not None:
             if len(dipbench.velocity_waveforms[dipbench.velocity]) >= sample_length * 2:
                 monitor_wave = dipbench.velocity_waveforms[dipbench.velocity]
@@ -660,12 +747,25 @@ def main():
             monitor_wave = dipbench.realtime_waveform
             std = np.std(monitor_wave)
         if monitor_wave is not None:
+            # display left ch wave form
+            waveform = monitor_wave[:,0]
+            if len(waveform) >= sample_length * 2:
+                waveform = waveform[sample_length:sample_length * 2]
+                waveform_pointlist = np.column_stack((np.linspace(base_size, window_size[0] // 2 - base_size, sample_length), waveform / std * vector_scope_size + keyboard_top // 2))
+                pygame.draw.lines(screen, (96, 96, 96), False, waveform_pointlist)
+
             # display vector scope
             if std < 16.0:
                 std = 16.0
             monitor_wave = (-monitor_wave + np.stack([monitor_wave[:,1], -monitor_wave[:,0]], axis=1)) * 0.707
-            pointlist = (monitor_wave[:sampling_freq // 2] - np.mean(monitor_wave[sample_length:sample_length * 2])) / std * vector_scope_size + (screen_size[0] // 4, keyboard_top // 2)
+            pointlist = (monitor_wave[:sampling_freq // 2] - np.mean(monitor_wave[sample_length:sample_length * 2])) / std * vector_scope_size + (window_size[0] // 4, keyboard_top // 2)
             pygame.draw.lines(screen, (0,224,0), False, pointlist)
+
+            if display_latency is not None:
+                latency_x = sampling_freq * display_latency / sample_length * (window_size[0] // 2 - base_size * 2) + base_size
+                pygame.draw.line(screen, (255,192,128), (latency_x, keyboard_top // 2 - base_size * 31), (latency_x, keyboard_top // 2 + base_size * 31), line_width)
+                latency_text = font.render(f'{display_latency * 1000:.1f} ms latency', True, (255,192,128))
+                screen.blit(latency_text, [latency_x + base_size, keyboard_top // 2 - base_size * 31])
 
         # prepare spectrum
         monitor_spectrum = None
@@ -676,8 +776,8 @@ def main():
         elif dipbench.monitor_mode == 3 and dipbench.realtime_spectrum is not None:
             monitor_spectrum = dipbench.realtime_spectrum
         if monitor_spectrum is not None:
-            x = np.linspace(screen_size[0] // 2 + base_margin, screen_size[0] - base_margin * 4 - velocity_width, spectrum_size // 4)
-            y = velocity_bottom - monitor_spectrum[:spectrum_size // 4] / 96 * screen_size[1] / 2
+            x = np.linspace(window_size[0] // 2 + base_margin, window_size[0] - base_margin * 4 - velocity_width, spectrum_size // 4)
+            y = velocity_bottom - monitor_spectrum[:spectrum_size // 4] / 96 * window_size[1] / 2
             pointlist = np.stack([x, y], axis=1)
             pygame.draw.lines(screen, (0,224,0), False, pointlist)
 
